@@ -1,0 +1,32 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="F_EnsureMaxVelo" Id="{16893116-0d2a-4350-9d82-f09f1a19198a}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION F_EnsureMaxVelo: BOOL
+VAR_IN_OUT
+	fNextVeloX : LREAL;
+	fNextVeloY : LREAL;
+END_VAR
+VAR
+	fNormNextVelo : LREAL;
+	fNextVeloUnitLength : LREAL;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[fNormNextVelo := TO_LREAL(F_2Norm(fA := TO_REAL(fNextVeloX), fB := TO_REAL(fNextVeloY)));
+IF fNormNextVelo > GVL.fMaxVelo THEN
+	fNextVeloX := (fNextVeloX/fNormNextVelo) * GVL.fMaxVelo;
+	fNextVeloY := (fNextVeloY/fNormNextVelo) * GVL.fMaxVelo;
+	F_EnsureMaxVelo := TRUE;
+END_IF
+F_EnsureMaxVelo := FALSE;]]></ST>
+    </Implementation>
+    <LineIds Name="F_EnsureMaxVelo">
+      <LineId Id="7" Count="0" />
+      <LineId Id="12" Count="1" />
+      <LineId Id="15" Count="0" />
+      <LineId Id="25" Count="0" />
+      <LineId Id="14" Count="0" />
+      <LineId Id="27" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

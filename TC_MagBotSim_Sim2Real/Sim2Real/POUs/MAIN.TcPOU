@@ -1,0 +1,616 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="MAIN" Id="{cad8c063-71e6-4d73-b82b-27fe79f141a8}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM MAIN
+VAR
+	bStart 		: BOOL;
+	bStop 		: BOOL;
+	bError 		: BOOL;
+	nState 		: UDINT := 0; // state machine
+	nIdxMover 	: UDINT := 1; // mover index
+	
+	nIdxPolicyOutput : UDINT;
+	
+	bAllMoversBusy	: BOOL;
+	bAllMoversDone	: BOOL;
+	nCycleCounter	: UDINT := 1;
+	
+	aPolicyOutputScaled	: ARRAY[1..GVL.nPolicyOutputDim] OF REAL;
+	aPolicyOutputUnscaled	: ARRAY[1..GVL.nPolicyOutputDim] OF REAL;
+	
+	nSumMoversEnabled 	: UDINT := 0;
+	nSumMoversDone		: UDINT := 0;
+	
+	aMCPlanarFeedback	: ARRAY[1..GVL.nNumMovers] OF MC_PlanarFeedback;
+	stOptionsESG 		: ST_ExternalSetpointGenerationOptions;
+	stMoveCOptions		: ST_MoveCOptions;
+	iDynConstraint		: IPlcDynamicConstraint;
+	
+	fbStartProcess 		: NT_StartProcess;
+	fbTimer				: TON;
+	tTime				: TIME := T#0D0H0M10S0MS;
+	
+	fbXPlanarEnvironment		: FB_TcIoXPlanarEnvironment;
+	bInitXPlanarEnv				: BOOL := TRUE;
+	MoverCommunicationStatus	: CoordinatedMoverCommStatus;
+	
+	fXPosMover  : REAL;
+	fYPosMover	: REAL;
+	
+	nSumGoalsReachedAllMovers 			: DINT := 0;
+	bBenchmarkReachedPerMoverFinished 	: BOOL := FALSE;
+	bBenchmarkReachedAllFinished 		: BOOL := FALSE;
+	bBenchmarkSuccessRateFinished 		: BOOL := FALSE;
+	
+	
+	nCounterNoGoalReached			: UDINT := 0;
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[CASE nState OF
+	0:  // build all paths
+		GVL.fbGetWindowsUser();
+		IF GVL.fbGetWindowsUser.bDone THEN
+			GVL.sWindowsUser := GVL.fbGetWindowsUser.sUser;
+			GVL.sProjectPath := concat(concat('C:\Users\', GVL.sWindowsUser), GVL.sRelProjectPath);
+			GVL.sVisPath := concat(GVL.sProjectPath,'visualization');
+			GVL.sFnVisExe := concat(GVL.sVisPath, '\dist\demo.exe');			
+			GVL.sModelFile := concat(GVL.sProjectPath, GVL.sModelFileName);
+			nState := 1;
+		END_IF
+
+	1:	// wait for start
+		IF bStart AND NOT bStop AND NOT bError THEN
+			bStart := FALSE;
+			bStop := FALSE;
+			bAllMoversBusy := FALSE;
+			bAllMoversDone := FALSE;
+			GVL.bVisualizeGoals := TRUE;
+			GVL.bExtSetpointGenActive := FALSE;
+			GVL.bAllMoversEnabled := FALSE;
+			GVL.fbDrand(Seed := GVL.nSeed);
+			fbTimer.IN := FALSE; // reset timer
+			
+			FOR nIdxMover := 1 TO GVL.nNumMovers DO
+				GVL.aNumGoalsReached[nIdxMover] := 0;
+				GVL.aNumCycles1KGoalsReachedSingle[nIdxMover] := 0;
+			END_FOR
+			GVL.nNumCycles3KGoalsReachedAll := 0;
+			nSumGoalsReachedAllMovers := 0;
+			bBenchmarkReachedPerMoverFinished := FALSE;
+			bBenchmarkReachedAllFinished := FALSE;
+			bBenchmarkSuccessRateFinished := FALSE;
+			GVL.nNumTimeouts := 0;
+			
+			nState := 10;
+		END_IF
+		
+	10: // init env
+		IF bInitXPlanarEnv THEN
+			IF fbXPlanarEnvironment.Init(TRUE) THEN
+				fbXPlanarEnvironment.Init(FALSE);
+				bInitXPlanarEnv := FALSE;
+				nState := nState + 1;
+			END_IF
+		ELSE
+			nState := nState + 1;
+		END_IF
+	
+	11:// mover communication
+		IF fbXPlanarEnvironment.XpuTcIo(1).SetCoordMoverCommunicationCmd(CoordinatedMoverCommCommand.IdentifyAndAssignPossible) THEN
+			nState := nState + 1;
+		END_IF
+		
+	12: // check mover communication
+		MoverCommunicationStatus := fbXPlanarEnvironment.XpuTcIo(1).GetCoordMoverCommStatus();
+		IF MoverCommunicationStatus = CoordinatedMoverCommStatus.CommunicationSuccessful THEN
+			nState := 20;
+		END_IF
+
+	20:	// load policy
+		GVL.fbMLPredict.stPredictionParameter.MaxConcurrency := GVL.nMaxConcurrency;
+		GVL.fbMLPredict.stPredictionParameter.MlModelFilepath := GVL.sModelFile;				
+		IF GVL.fbMLPredict.Configure() THEN
+			// check input and output dimensions and data type
+			bError := GVL.fbMLPredict.GetInputDim(GVL.nInputDim);
+			bError := GVL.fbMLPredict.GetOutputDim(GVL.nOutputDim);
+			bError := GVL.fbMLPredict.CheckPreferredIODataTypes(ETcMllDataType.E_MLLDT_FP32_REAL,ETcMllDataType.E_MLLDT_FP32_REAL,GVL.bPreferredIODataType);
+			bError := GVL.fbMlPredict.CheckSupportedIODataTypes(ETcMllDataType.E_MLLDT_FP32_REAL,ETcMllDataType.E_MLLDT_FP32_REAL,GVL.bSupportedIODataType);
+		
+			IF GVL.bPreferredIODataType OR GVL.bSupportedIODataType THEN
+				GVL.eDtype := ETcMllDataType.E_MLLDT_FP32_REAL;
+			END_IF
+			
+			IF bError OR GVL.fbMLPredict.bError OR GVL.nInputDim <> GVL.nPolicyInputDim OR GVL.nOutputDim <> GVL.nPolicyOutputDim THEN
+				nState := 999;
+			ELSE
+				nState := 30;
+			END_IF
+		END_IF
+ 
+		
+	30:
+		fbStartProcess.START := TRUE;
+		IF fbStartProcess.BUSY THEN
+			fbTimer.IN := TRUE;
+			nState := nState + 1;
+		END_IF
+		
+	31:
+		fbStartProcess.START := FALSE;
+		IF NOT fbStartProcess.BUSY AND fbTimer.Q THEN
+			nState := 40;
+		END_IF
+
+	40: // enable all movers
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			GVL.aMovers[nIdxMover].Enable(0);
+		END_FOR
+		nState := nState + 1;
+		
+	41:	// wait until all movers are enabled
+		nSumMoversEnabled := 0;
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			IF GVL.aMovers[nIdxMover].MCTOPLC.STD.State = MC_PLANAR_STATE.Enabled THEN
+				nSumMoversEnabled := nSumMoversEnabled + 1;
+			END_IF
+		END_FOR
+		IF nSumMoversEnabled = GVL.nNumMovers THEN
+			GVL.bAllMoversEnabled := TRUE;
+			nState := nState + 1;
+		END_IF
+		
+	42: // move C
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			GVL.aMovers[nIdxMover].MoveC(commandFeedback := aMCPlanarFeedback[nIdxMover], targetPosition := 0.0, constraint := 0, options := 0);
+		END_FOR
+		nState := nState + 1;
+		
+	43:
+		nSumMoversDone := 0;
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			IF aMCPlanarFeedback[nIdxMover].Done THEN
+				nSumMoversDone := nSumMoversDone + 1;
+			END_IF
+		END_FOR
+		IF nSumMoversDone = GVL.nNumMovers THEN
+			nState := 50;
+		END_IF
+	
+	50: // sample first goals
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			M_SampleGoal(nIdxMover := nIdxMover);
+			GVL.nNumGoalsGenerated := GVL.nNumGoalsGenerated + 1;
+		END_FOR
+		nState := 70;
+		
+	70:	// prepare desired positions, velocities and accelerations before starting external setpoint generation
+		GVL.fMoverZPos := GVL.aMovers[1].MCTOPLC.ACT.ActPos.z;
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			// start position = current position of the mover
+			GVL.aMoverPos[nIdxMover] := GVL.aMovers[nIdxMover].MCTOPLC.ACT.ActPos;
+			// start velocities 
+			GVL.aMoverVelosDesired[nIdxMover].x := 0.0;
+			GVL.aMoverVelosDesired[nIdxMover].y := 0.0;
+			GVL.aMoverVelosDesired[nIdxMover].z := 0.0;
+			GVL.aMoverVelosDesired[nIdxMover].a := 0.0;
+			GVL.aMoverVelosDesired[nIdxMover].b := 0.0;
+			GVL.aMoverVelosDesired[nIdxMover].c := 0.0;
+			
+			GVL.aMoverVelosCurrent[nIdxMover].x := 0.0;
+			GVL.aMoverVelosCurrent[nIdxMover].y := 0.0;
+			GVL.aMoverVelosCurrent[nIdxMover].z := 0.0;
+			GVL.aMoverVelosCurrent[nIdxMover].a := 0.0;
+			GVL.aMoverVelosCurrent[nIdxMover].b := 0.0;
+			GVL.aMoverVelosCurrent[nIdxMover].c := 0.0;
+			// start accelerations 
+			GVL.aMoverAccs[nIdxMover].x := 0.0;
+			GVL.aMoverAccs[nIdxMover].y := 0.0;
+			GVL.aMoverAccs[nIdxMover].z := 0.0;
+			GVL.aMoverAccs[nIdxMover].a := 0.0;
+			GVL.aMoverAccs[nIdxMover].b := 0.0;
+			GVL.aMoverAccs[nIdxMover].c := 0.0;
+		END_FOR
+		nState := nState + 1;
+		
+	71: // start external setpoint generation for each mover
+		stOptionsESG.mode := MC_EXTERNAL_SET_POSITION_MODE.Absolute;
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			GVL.aMovers[nIdxMover].StartExternalSetpointGeneration(aMCPlanarFeedback[nIdxMover],stOptionsESG);
+		END_FOR
+		nState := nState + 1;
+		
+	72: // wait until external setpoint generation is active
+		nSumMoversDone := 0;
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			IF aMCPlanarFeedback[nIdxMover].Done THEN
+				nSumMoversDone := nSumMoversDone + 1;
+			END_IF
+		END_FOR
+		IF nSumMoversDone = GVL.nNumMovers THEN
+			GVL.bExtSetpointGenActive := TRUE;
+			GVL.bExtSetpointGenStart := TRUE;
+			nCycleCounter := 0;
+			nState := 80;
+		END_IF
+		
+	80: // planning - stop or set new accelerations
+		IF bStop OR bError OR (bBenchmarkReachedPerMoverFinished AND bBenchmarkReachedAllFinished AND bBenchmarkSuccessRateFinished) THEN
+			// stop external setpoint generation
+			nState := 200;
+		ELSIF nCycleCounter = 0 OR nCycleCounter > GVL.nNumCycles THEN
+			GVL.fbMLPredict.Predict(
+					pDataInp := ADR(GVL.aSimState), 
+					nDataInpDim := GVL.nPolicyInputDim, 
+					fmtDataInpType:= GVL.eDtype, 
+					pDataOut:= ADR(aPolicyOutputScaled), 
+					nDataOutDim:= GVL.nPolicyOutputDim, 
+					fmtDataOutType:= GVL.eDtype, 
+					nEngineId:= 0, // only one engine available in this model
+					nConcurrencyId:=0);
+					
+			FOR nIdxPolicyOutput := 1 TO GVL.nPolicyOutputDim DO
+				// undo action scaling
+				aPolicyOutputUnscaled[nIdxPolicyOutput] := GVL.fActionSpaceLow + (0.5 * (aPolicyOutputScaled[nIdxPolicyOutput] + 1.0) * (GVL.fActionSpaceHigh - GVL.fActionSpaceLow));
+			END_FOR
+			FOR nIdxMover := 1 TO GVL.nNumMovers DO
+				GVL.aMoverAccs[nIdxMover].x := aPolicyOutputUnscaled[(nIdxMover - 1) * 2 + 1] * 1000.0;
+				GVL.aMoverAccs[nIdxMover].y := aPolicyOutputUnscaled[(nIdxMover - 1) * 2 + 2] * 1000.0;
+			END_FOR
+			nCycleCounter := 1;
+		ELSE
+			nCycleCounter := nCycleCounter + 1;
+		END_IF
+		
+		// benchmarks
+		bBenchmarkReachedPerMoverFinished := TRUE;
+		nSumGoalsReachedAllMovers := 0;
+		// makespan
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			nSumGoalsReachedAllMovers := nSumGoalsReachedAllMovers + GVL.aNumGoalsReached[nIdxMover];
+			IF GVL.aNumGoalsReached[nIdxMover] < GVL.nNumGoalsToReachPerMover THEN
+				GVL.aNumCycles1KGoalsReachedSingle[nIdxMover] := GVL.aNumCycles1KGoalsReachedSingle[nIdxMover] + 1;
+				bBenchmarkReachedPerMoverFinished := bBenchmarkReachedPerMoverFinished AND (GVL.aNumGoalsReached[nIdxMover] >= GVL.nNumGoalsToReachPerMover);
+			END_IF
+		END_FOR
+		// throughput
+		IF nSumGoalsReachedAllMovers < GVL.nNumGoalsToReachAllMovers THEN
+			bBenchmarkReachedAllFinished := FALSE;
+			GVL.nNumCycles3KGoalsReachedAll := GVL.nNumCycles3KGoalsReachedAll + 1;
+		ELSE
+			bBenchmarkReachedAllFinished := TRUE;
+		END_IF
+		
+	200:// stop external setpoint generation, all movers will reduce their velocity to 0 (automatically)
+		GVL.bExtSetpointGenStart := FALSE;
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			GVL.aMovers[nIdxMover].StopExternalSetpointGeneration(aMCPlanarFeedback[nIdxMover]);
+		END_FOR
+		nState := nState + 1;
+		
+	201:// wait until external setpoint generation is stopped
+		nSumMoversDone := 0;
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			IF aMCPlanarFeedback[nIdxMover].Done THEN
+				nSumMoversDone := nSumMoversDone + 1;
+			END_IF
+		END_FOR
+		IF nSumMoversDone = GVL.nNumMovers THEN
+			GVL.bExtSetpointGenActive := FALSE;
+			nState := nState + 1;
+		END_IF	
+		
+	202:// disable all movers
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			GVL.aMovers[nIdxMover].Disable(aMCPlanarFeedback[nIdxMover]);
+		END_FOR
+		nState := nState + 1;
+		
+	203:// wait until all movers are disabled
+		nSumMoversDone := 0;
+		FOR nIdxMover := 1 TO GVL.nNumMovers DO
+			IF NOT aMCPlanarFeedback[nIdxMover].Done THEN
+				nSumMoversDone := nSumMoversDone + 1;
+			END_IF
+		END_FOR
+		IF nSumMoversDone = GVL.nNumMovers THEN
+			GVL.bAllMoversEnabled := FALSE;
+			nState := 1;
+		END_IF
+	
+	999: // error state
+		GVL.bExtSetpointGenStart := FALSE;
+		bError := TRUE;
+		IF GVL.bExtSetpointGenActive THEN
+			// stop external setpoint generation
+			nState := 200; 
+		END_IF
+		
+END_CASE
+
+IF nState > 1 THEN
+	nCounterNoGoalReached := 0;
+	FOR nIdxMover := 1 TO GVL.nNumMovers DO
+		IF GVL.bExtSetpointGenActive AND GVL.bExtSetpointGenStart THEN
+			// velocity
+			GVL.aMoverVelosCurrent[nIdxMover].x := GVL.aMoverVelosDesired[nIdxMover].x + (GVL.fDTPrio * GVL.aMoverAccs[nIdxMover].x);
+			GVL.aMoverVelosCurrent[nIdxMover].y := GVL.aMoverVelosDesired[nIdxMover].y + (GVL.fDTPrio * GVL.aMoverAccs[nIdxMover].y);
+			GVL.aMoverVelosDesired[nIdxMover].x := GVL.aMoverVelosCurrent[nIdxMover].x;
+			GVL.aMoverVelosDesired[nIdxMover].y := GVL.aMoverVelosCurrent[nIdxMover].y;
+			IF F_EnsureMaxVelo(fNextVeloX := GVL.aMoverVelosDesired[nIdxMover].x, fNextVeloY := GVL.aMoverVelosDesired[nIdxMover].y) THEN
+				GVL.aMoverAccs[nIdxMover].x := (GVL.aMoverVelosCurrent[nIdxMover].x - GVL.aMoverVelosDesired[nIdxMover].x)/GVL.fDTPrio;
+				GVL.aMoverAccs[nIdxMover].y := (GVL.aMoverVelosCurrent[nIdxMover].y - GVL.aMoverVelosDesired[nIdxMover].y)/GVL.fDTPrio;
+			END_IF
+			GVL.aMoverVelosDesired[nIdxMover].z := GVL.fMoverZPos - GVL.aMoverPos[nIdxMover].z;	
+		
+			// position
+			GVL.aMoverPos[nIdxMover].x := GVL.aMoverPos[nIdxMover].x + (GVL.fDTPrio * GVL.aMoverVelosDesired[nIdxMover].x);
+			GVL.aMoverPos[nIdxMover].y := GVL.aMoverPos[nIdxMover].y + (GVL.fDTPrio * GVL.aMoverVelosDesired[nIdxMover].y);
+			GVL.aMoverPos[nIdxMover].z := GVL.fMoverZPos;
+			
+			// set new setpoint
+			GVL.aMovers[nIdxMover].SetExternalSetpoint(GVL.aMoverPos[nIdxMover],GVL.aMoverVelosDesired[nIdxMover],GVL.aMoverAccs[nIdxMover]);
+		END_IF
+		// update mover state and command feedback
+		GVL.aMovers[nIdxMover].Update();
+		aMCPlanarFeedback[nIdxMover].Update();
+		// update mover sim state
+		M_GetSimState(aSimState => GVL.aSimState);
+		// check errors
+		IF (GVL.aMovers[nIdxMover].Error OR aMCPlanarFeedback[nIdxMover].Error) AND nState < 200 AND nState <> 1 THEN
+			nState := 999;
+		END_IF
+		// check goal reached
+		IF M_CheckGoalReached(nIdxMover := nIdxMover) THEN
+			// if goal is reached: sample new goal, else: use old goal
+			IF GVL.nNumGoalsGenerated < GVL.nNumGoalsToGenerate THEN
+				GVL.aNumGoalsReached[nIdxMover] := GVL.aNumGoalsReached[nIdxMover] + 1;
+				M_SampleGoal(nIdxMover := nIdxMover);
+				GVL.nNumGoalsGenerated := GVL.nNumGoalsGenerated + 1;
+				IF GVL.nNumGoalsGenerated = GVL.nNumGoalsToGenerate THEN
+					GVL.nCounterTimeout := -1;
+					
+					nSumGoalsReachedAllMovers := 0;
+					// makespan
+					FOR nIdxMover := 1 TO GVL.nNumMovers DO
+						nSumGoalsReachedAllMovers := nSumGoalsReachedAllMovers + GVL.aNumGoalsReached[nIdxMover];
+					END_FOR
+					GVL.nNumGoalsMoverEnd := nSumGoalsReachedAllMovers;
+					EXIT;
+				END_IF
+			ELSIF NOT GVL.aLastGoalMeasured[nIdxMover] THEN
+				GVL.aNumGoalsReached[nIdxMover] := GVL.aNumGoalsReached[nIdxMover] + 1;
+				GVL.aLastGoalMeasured[nIdxMover] := TRUE;
+			END_IF
+		ELSE
+			nCounterNoGoalReached := nCounterNoGoalReached + 1;
+		END_IF
+	END_FOR
+	IF nState = 80 THEN
+		// check whether timeout counter must be increased or resetted
+		IF nCounterNoGoalReached = GVL.nNumMovers OR GVL.nNumGoalsGenerated >= GVL.nNumGoalsToGenerate THEN
+			GVL.nCounterTimeout := GVL.nCounterTimeout + 1;
+		ELSE
+			GVL.nCounterTimeout := 0;
+		END_IF
+		// if timeout, sample new goals for all movers
+		IF GVL.nCounterTimeout = GVL.nNumCyclesTimeout THEN
+			GVL.nNumTimeouts := GVL.nNumTimeouts + 1;
+			IF GVL.nNumGoalsGenerated >= GVL.nNumGoalsToGenerate THEN
+				bBenchmarkSuccessRateFinished := TRUE;
+			END_IF
+			IF NOT bBenchmarkSuccessRateFinished OR NOT bBenchmarkReachedPerMoverFinished OR NOT bBenchmarkReachedAllFinished THEN
+				FOR nIdxMover := 1 TO GVL.nNumMovers DO
+					M_SampleGoal(nIdxMover := nIdxMover);
+					GVL.nNumGoalsGenerated := GVL.nNumGoalsGenerated + 1;
+				END_FOR
+				GVL.nCounterTimeout := 0;
+				nCycleCounter := 0;	
+			END_IF
+		ELSIF GVL.nNumGoalsGenerated >= GVL.nNumGoalsToGenerate AND nSumGoalsReachedAllMovers = (GVL.nNumGoalsMoverEnd + GVL.nNumMovers) THEN
+			bBenchmarkSuccessRateFinished := TRUE;
+		END_IF
+	END_IF
+		
+	// visualization
+	fbStartProcess(PATHSTR := GVL.sFnVisExe);
+	IF fbStartProcess.ERR THEN
+		nState := 999;
+	END_IF
+	fbTimer(PT := tTime);
+END_IF]]></ST>
+    </Implementation>
+    <Method Name="M_CheckGoalReached" Id="{aaab3ede-786e-42e4-b619-eceb95de2b35}">
+      <Declaration><![CDATA[METHOD M_CheckGoalReached : BOOL
+VAR_INPUT
+	nIdxMover : UDINT; // mover index
+END_VAR
+	
+VAR
+	fDiffXSim : REAL;
+	fDiffYSim : REAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[fDiffXSim := GVL.aMoverGoalsXSim[nIdxMover] - (TO_REAL(GVL.aMovers[nIdxMover].MCTOPLC.SET.SetPos.x) * 0.001); // [m]
+fDiffYSim := GVL.aMoverGoalsYSim[nIdxMover] - (TO_REAL(GVL.aMovers[nIdxMover].MCTOPLC.SET.SetPos.y) * 0.001); // [m]
+
+IF F_2Norm(fA := fDiffXSim, fB := fDiffYSim) < GVL.fThresholdPosSim THEN
+	M_CheckGoalReached := TRUE;
+ELSE
+	M_CheckGoalReached := FALSE;
+END_IF]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_GetSimState" Id="{e5aba9fe-8f7e-47ac-bde4-d8982bc70024}">
+      <Declaration><![CDATA[METHOD M_GetSimState :  BOOL
+VAR
+	nIdxMover	: UDINT;
+END_VAR
+
+VAR_OUTPUT
+	aSimState : ARRAY[1..GVL.nNumMovers*6] OF REAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[FOR nIdxMover := 1 TO GVL.nNumMovers DO
+	// position ("achieved_goal")
+	aSimState[(nIdxMover - 1) * 2 + 1] := TO_REAL(GVL.aMovers[nIdxMover].MCTOPLC.ACT.ActPos.x) * 0.001; // [m]
+	aSimState[(nIdxMover - 1) * 2 + 2] := TO_REAL(GVL.aMovers[nIdxMover].MCTOPLC.ACT.ActPos.y) * 0.001; // [m]
+	// goal ("desired_goal")
+	aSimState[(GVL.nNumMovers*2) + (nIdxMover - 1) * 2 + 1] := GVL.aMoverGoalsXSim[nIdxMover];
+	aSimState[(GVL.nNumMovers*2) + (nIdxMover - 1) * 2 + 2] := GVL.aMoverGoalsYSim[nIdxMover];
+	// velocity ("observation")
+	aSimState[(GVL.nNumMovers*2*2) + (nIdxMover - 1) * 2 + 1] := TO_REAL(GVL.aMovers[nIdxMover].MCTOPLC.ACT.ActVelo.x) * 0.001; // [m/s]
+	aSimState[(GVL.nNumMovers*2*2) + (nIdxMover - 1) * 2 + 2] := TO_REAL(GVL.aMovers[nIdxMover].MCTOPLC.ACT.ActVelo.y) * 0.001; // [m/s]
+END_FOR
+M_GetSimState := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="M_SampleGoal" Id="{953d2fc0-d93a-4ff6-b050-7a49d79b97a9}">
+      <Declaration><![CDATA[METHOD M_SampleGoal
+VAR_INPUT
+	nIdxMover 			: UDINT; // mover index
+END_VAR
+VAR 
+	fRandomNumber 		: LREAL;
+	fDiffXSim 			: REAL;
+	fDiffYSim 			: REAL;
+	fMoverGoalXSim 		: REAL;
+	fMoverGoalYSim 		: REAL;
+	fObstacleGoalXSim 	: REAL;
+	fObstacleGoalYSim 	: REAL;
+	nIdx				: UDINT;
+	nSumDistGoalsValid	: UDINT;
+END_VAR
+]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[// generate x-position of the goal
+GVL.fbDrand(num => fRandomNumber);
+fMoverGoalXSim := (GVL.aMaxPosSim[1] - GVL.aMinPosSim[1]) * TO_REAL(fRandomNumber) + GVL.aMinPosSim[1]; // [m]
+// generate y-position of the goal
+GVL.fbDrand(num => fRandomNumber);
+fMoverGoalYSim := (GVL.aMaxPosSim[2] - GVL.aMinPosSim[2]) * TO_REAL(fRandomNumber) + GVL.aMinPosSim[2]; // [m]
+
+GVL.aMoverGoalsXSim[nIdxMover] := fMoverGoalXSim;
+GVL.aMoverGoalsYSim[nIdxMover] := fMoverGoalYSim;
+
+]]></ST>
+      </Implementation>
+    </Method>
+    <LineIds Name="MAIN">
+      <LineId Id="597" Count="17" />
+      <LineId Id="616" Count="2" />
+      <LineId Id="620" Count="1" />
+      <LineId Id="1139" Count="1" />
+      <LineId Id="1143" Count="0" />
+      <LineId Id="1145" Count="0" />
+      <LineId Id="1142" Count="0" />
+      <LineId Id="1162" Count="0" />
+      <LineId Id="1239" Count="0" />
+      <LineId Id="1475" Count="0" />
+      <LineId Id="1179" Count="0" />
+      <LineId Id="1234" Count="0" />
+      <LineId Id="1314" Count="0" />
+      <LineId Id="1163" Count="0" />
+      <LineId Id="622" Count="97" />
+      <LineId Id="1138" Count="0" />
+      <LineId Id="720" Count="0" />
+      <LineId Id="738" Count="13" />
+      <LineId Id="989" Count="0" />
+      <LineId Id="991" Count="4" />
+      <LineId Id="990" Count="0" />
+      <LineId Id="752" Count="26" />
+      <LineId Id="1033" Count="0" />
+      <LineId Id="779" Count="3" />
+      <LineId Id="921" Count="2" />
+      <LineId Id="920" Count="0" />
+      <LineId Id="912" Count="7" />
+      <LineId Id="910" Count="0" />
+      <LineId Id="971" Count="2" />
+      <LineId Id="975" Count="0" />
+      <LineId Id="974" Count="0" />
+      <LineId Id="924" Count="1" />
+      <LineId Id="927" Count="0" />
+      <LineId Id="926" Count="0" />
+      <LineId Id="931" Count="0" />
+      <LineId Id="928" Count="2" />
+      <LineId Id="1185" Count="0" />
+      <LineId Id="1187" Count="0" />
+      <LineId Id="1189" Count="0" />
+      <LineId Id="1242" Count="0" />
+      <LineId Id="1230" Count="0" />
+      <LineId Id="1190" Count="6" />
+      <LineId Id="1229" Count="0" />
+      <LineId Id="1197" Count="2" />
+      <LineId Id="1472" Count="1" />
+      <LineId Id="1186" Count="0" />
+      <LineId Id="813" Count="16" />
+      <LineId Id="833" Count="0" />
+      <LineId Id="835" Count="30" />
+      <LineId Id="1206" Count="0" />
+      <LineId Id="866" Count="1" />
+      <LineId Id="980" Count="2" />
+      <LineId Id="986" Count="1" />
+      <LineId Id="983" Count="1" />
+      <LineId Id="988" Count="0" />
+      <LineId Id="985" Count="0" />
+      <LineId Id="978" Count="1" />
+      <LineId Id="868" Count="3" />
+      <LineId Id="876" Count="15" />
+      <LineId Id="1251" Count="0" />
+      <LineId Id="1424" Count="0" />
+      <LineId Id="1125" Count="0" />
+      <LineId Id="1137" Count="0" />
+      <LineId Id="1303" Count="1" />
+      <LineId Id="1405" Count="0" />
+      <LineId Id="1407" Count="2" />
+      <LineId Id="1406" Count="0" />
+      <LineId Id="1410" Count="0" />
+      <LineId Id="1404" Count="0" />
+      <LineId Id="1421" Count="0" />
+      <LineId Id="1302" Count="0" />
+      <LineId Id="1425" Count="0" />
+      <LineId Id="1428" Count="0" />
+      <LineId Id="1426" Count="0" />
+      <LineId Id="1252" Count="0" />
+      <LineId Id="1202" Count="0" />
+      <LineId Id="1204" Count="0" />
+      <LineId Id="897" Count="1" />
+      <LineId Id="1358" Count="0" />
+      <LineId Id="899" Count="0" />
+      <LineId Id="1208" Count="1" />
+      <LineId Id="1211" Count="1" />
+      <LineId Id="1210" Count="0" />
+      <LineId Id="1213" Count="1" />
+      <LineId Id="1313" Count="0" />
+      <LineId Id="1224" Count="2" />
+      <LineId Id="1305" Count="0" />
+      <LineId Id="1308" Count="4" />
+      <LineId Id="1306" Count="1" />
+      <LineId Id="1415" Count="0" />
+      <LineId Id="1216" Count="0" />
+      <LineId Id="1416" Count="0" />
+      <LineId Id="1359" Count="0" />
+      <LineId Id="1207" Count="0" />
+      <LineId Id="900" Count="5" />
+      <LineId Id="2" Count="0" />
+    </LineIds>
+    <LineIds Name="MAIN.M_CheckGoalReached">
+      <LineId Id="45" Count="6" />
+      <LineId Id="26" Count="0" />
+    </LineIds>
+    <LineIds Name="MAIN.M_GetSimState">
+      <LineId Id="6" Count="3" />
+      <LineId Id="13" Count="2" />
+      <LineId Id="55" Count="1" />
+      <LineId Id="54" Count="0" />
+      <LineId Id="35" Count="1" />
+    </LineIds>
+    <LineIds Name="MAIN.M_SampleGoal">
+      <LineId Id="104" Count="5" />
+      <LineId Id="225" Count="1" />
+      <LineId Id="224" Count="0" />
+      <LineId Id="81" Count="0" />
+      <LineId Id="15" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

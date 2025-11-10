@@ -1,0 +1,19 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="F_2Norm" Id="{fa173772-ba73-4cf1-8b38-ecc044cf1fd4}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION F_2Norm : REAL
+VAR_INPUT
+	fA : REAL;
+	fB : REAL;
+END_VAR
+VAR
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[F_2Norm := SQRT(fA*fA + fB*fB);]]></ST>
+    </Implementation>
+    <LineIds Name="F_2Norm">
+      <LineId Id="15" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

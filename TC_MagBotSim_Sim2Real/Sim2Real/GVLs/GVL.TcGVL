@@ -1,0 +1,95 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <GVL Name="GVL" Id="{e63a4674-fe14-48cf-bc5e-c5dae03e4364}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+VAR_GLOBAL
+	// XPlanar
+	aMovers 						: ARRAY[1..nNumMovers] OF MC_PlanarMover;
+	aMoverPos 						: ARRAY[1..GVL.nNumMovers] OF MoverVector;
+	aMoverVelosDesired				: ARRAY[1..GVL.nNumMovers] OF MoverVector;
+	aMoverVelosCurrent				: ARRAY[1..GVL.nNumMovers] OF MoverVector;
+	aMoverAccs 						: ARRAY[1..GVL.nNumMovers] OF MoverVector;
+	bAllMoversEnabled 				: BOOL;
+	bExtSetpointGenActive 			: BOOL := FALSE;
+	bExtSetpointGenStart			: BOOL := FALSE;
+	fMoverZPos						: LREAL;
+	                        		
+	// Planning             		
+	aSimState						: ARRAY[1..GVL.nNumMovers*6] OF REAL;
+	aMoverGoalsXSim 				: ARRAY[1..GVL.nNumMovers] OF REAL;
+	aMoverGoalsYSim 				: ARRAY[1..GVL.nNumMovers] OF REAL;
+	aMoverAccsDebug					: ARRAY[1..GVL.nNumMovers] OF MoverVector;
+	aCntGoals						: ARRAY[1..GVL.nNumMovers] OF UDINT;
+	                        		
+	// RNG                  		
+	fbDrand 						: DRAND;
+	                        		
+	// Benchmarks           		
+	nNumGoalsGenerated 				: DINT := 0;
+	aNumGoalsReached 				: ARRAY[1..GVL.nNumMovers] OF DINT := [GVL.nNumMovers(0)];
+	aNumCycles1KGoalsReachedSingle	: ARRAY[1..GVL.nNumMovers] OF DINT := [GVL.nNumMovers(0)];
+	nNumCycles3KGoalsReachedAll 	: DINT := 0;
+	nNumGoalsToGenerate				: DINT := 15000; // success rate
+	nNumGoalsToReachPerMover		: DINT := 1000; // makespan
+	nNumGoalsToReachAllMovers		: DINT := 3000; // throughput
+	nCounterTimeout			  		: DINT := 0;
+	nNumCyclesTimeout				: DINT := 120 * 50;
+	nNumTimeouts					: DINT := 0;
+	nNumGoalsMoverEnd				: DINT := 0;
+	aLastGoalMeasured				: ARRAY[1..GVL.nNumMovers] OF BOOL := [GVL.nNumMovers(FALSE)];
+ 	
+	// Paths                	
+	fbGetWindowsUser				: FB_GetWindowsUser;
+	sWindowsUser					: STRING(255);
+	sRelProjectPath					: STRING(255) := '\Documents\TcXaeShell\TC_MagBotSim_Sim2Real\';  // relative to C:\Users\%user% 
+	sProjectPath					: STRING(255);
+	sVisPath						: STRING(255);
+	sFnVisExe						: STRING(255);	
+	                        	
+	// ML model (policy)    	
+	fbMLPredict 					: FB_MllPrediction;	
+	nMaxConcurrency 				: UINT := 1;
+	sModelFileName					: STRING(255) := 'models\xml\PlanningPolicy_NumMovers_3_LearnJerk_False_NumCycles_120_Vmax_2.0_Amax_10.0.xml';
+	sModelFile 						: STRING(255);  // full path to mode file
+	nInputDim						: UDINT;
+	nOutputDim						: UDINT;
+	bPreferredIODataType 			: BOOL;
+	bSupportedIODataType 			: BOOL;
+	eDtype 							: ETcMllDataType := ETcMllDataType.E_MLLDT_FP32_REAL;
+	                        		
+	// Visu                 		
+	bBeamer 						: BOOL := TRUE;
+	bVisualizeGoals		 			: BOOL := TRUE;
+END_VAR
+
+VAR_GLOBAL CONSTANT
+	// XPlanar
+	nNumMovers 			: UINT := 3; // number of movers/agents
+	fMaxVelo 			: LREAL := 2000; // [mm/s]
+	fMaxAcc 			: LREAL := 10000; // [mm/s^2]
+	
+	// Policy
+	nPolicyInputDim		: UDINT := 3*2*GVL.nNumMovers;
+	nPolicyOutputDim 	: UDINT := 2*GVL.nNumMovers;
+	fActionSpaceLow		: REAL := -10.0; // [m/s^2]
+	fActionSpaceHigh	: REAL := 10.0; // [m/s^2]
+	
+	
+	// Goals and movers
+	fMoverSizeSim 		: REAL := 0.113; // [m]
+	fThresholdPosSim    : REAL := 0.1; // [m]
+	fEpsilon 			: REAL 	:= 0.043; // [m]
+	aNumTilesXY 		: ARRAY[1..2] OF UINT := [4,3];
+	aSizeFieldSim 		: ARRAY[1..2] OF REAL := [TO_REAL(GVL.aNumTilesXY[1])*0.24, TO_REAL(GVL.aNumTilesXY[2])*0.24]; // [m]
+	aMinPosSim 			: ARRAY[1..2] OF REAL := [0.09,0.09];//[GVL.fMoverSizeSim + GVL.fEpsilon, GVL.fMoverSizeSim + GVL.fEpsilon]; // [m], [min_x, min_y]
+	aMaxPosSim 			: ARRAY[1..2] OF REAL := [0.81,0.57];//[GVL.aSizeFieldSim[1] - GVL.fMoverSizeSim - GVL.fEpsilon,  GVL.aSizeFieldSim[2] - GVL.fMoverSizeSim - GVL.fEpsilon]; // [m], [max_x, max_y]
+	
+	// RNG
+	nSeed 				: INT := 22;
+	
+	// Planning
+	fDTPrio 			: REAL := 0.001; // s
+	nNumCycles			: UDINT := 120;
+END_VAR]]></Declaration>
+  </GVL>
+</TcPlcObject>
